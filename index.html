@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Захист неба</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; touch-action: none; user-select: none;
+    -webkit-user-select: none; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; }
+  .bar { position: fixed; top: calc(env(safe-area-inset-top) + 8px); left: 12px; right: 12px; display: flex; gap: 8px;
+    align-items: center; pointer-events: none; }
+  .bar button { pointer-events: auto; background: transparent; color: #8b95a3; border: 1px solid #2a3440; border-radius: 16px;
+    font: inherit; font-size: 12px; font-weight: 900; padding: 5px 10px; }
+  .bar .sp { flex: 1; }
+  .over { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; background: rgba(0, 0, 0, .55); color: #e6edf3; text-align: center; padding: 16px; }
+  .over h1 { color: #ff3b47; font-size: 34px; letter-spacing: 4px; margin: 0 0 4px; }
+  .over p { margin: 0; font-size: 14px; }
+  .over button { font: inherit; font-weight: 900; font-size: 15px; padding: 12px 22px; border-radius: 22px; min-width: 220px; }
+  .over .main { background: #22d3ee; color: #05070a; border: 0; }
+  .over .alt { background: transparent; color: #22d3ee; border: 1px solid #22d3ee; }
+  .over small { color: #8b95a3; font-size: 12px; max-width: 320px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="bar">
+  <button id="mute">🔊</button>
+  <span class="sp"></span>
+  <button id="quit">ВИЙТИ ›</button>
+</div>
+<div class="over" id="over">
+  <h1>GAME OVER</h1>
+  <p id="result"></p>
+  <button class="main" id="again">ГРАТИ ЩЕ</button>
+  <button class="alt" id="save">ЗАПИСАТИ РЕКОРД У БОТ</button>
+  <small>Тривоги приходять у чат бота й під час гри.</small>
+</div>
+<script>
+// «Sh0Fly: Захист неба» for Telegram: the app's Galaga-style game (lib/game/game_screen.dart) on a canvas.
+// An F-16 at the bottom, Shaheds / jet Shaheds / cruise missiles / bombers fly in formation, sway, dive and shoot.
+// Drag to move, fire is automatic. In Telegram the best score goes to the bot (WebApp.sendData) for its table.
+'use strict';
+const tg = window.Telegram && Telegram.WebApp && Telegram.WebApp.initData ? Telegram.WebApp : null;
+if (tg) { tg.ready(); tg.expand(); try { tg.disableVerticalSwipes(); } catch (e) {} }
+
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+let W = 0, H = 0, dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize); resize();
+
+const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+
+// ---------------------------------------------------------------- models (as on the app's map)
+const MODELS = {
+  shahed: { kind: 'drone', color: '#FFB020', type: 'shahed' }, jetShahed: { kind: 'drone', color: '#FF6B2C', type: 'jet' },
+  gerbera: { kind: 'drone', color: '#B0B8C4', type: 'shahed' }, lancet: { kind: 'drone', color: '#C6F26B', type: 'jet' },
+  recon: { kind: 'drone', color: '#67E8F9', type: 'shahed' },
+  kalibr: { kind: 'missile', color: '#FF4A4A', type: 'missile' }, kh101: { kind: 'missile', color: '#FF4A4A', type: 'missile' },
+  kh59: { kind: 'missile', color: '#FF4A4A', type: 'missile' }, kh22: { kind: 'missile', color: '#FF2D7A', type: 'missile' },
+  iskanderK: { kind: 'missile', color: '#FF4A4A', type: 'missile' },
+  kinzhal: { kind: 'ballistic', color: '#E25CFF', type: 'missile' }, iskanderM: { kind: 'ballistic', color: '#E25CFF', type: 'missile' },
+  kn23: { kind: 'ballistic', color: '#E25CFF', type: 'missile' }, s300: { kind: 'ballistic', color: '#FF7EB6', type: 'missile' },
+  strategic: { kind: 'aviation', color: '#9F7AEA', type: 'bomber' }, mig31: { kind: 'aviation', color: '#C4A7FF', type: 'jet' },
+  tactical: { kind: 'aviation', color: '#C4A7FF', type: 'jet' },
+};
+
+// Silhouettes, nose up, in a -1..1 box.
+const SHAPES = {
+  shahed: [[0, -1], [0.95, 0.55], [0.95, 0.75], [0.15, 0.6], [0, 0.85], [-0.15, 0.6], [-0.95, 0.75], [-0.95, 0.55]],
+  jet: [[0, -1], [0.2, -0.3], [0.85, 0.5], [0.85, 0.65], [0.2, 0.5], [0.35, 0.9], [-0.35, 0.9], [-0.2, 0.5], [-0.85, 0.65], [-0.85, 0.5], [-0.2, -0.3]],
+  missile: [[0, -1], [0.12, -0.75], [0.12, 0.1], [0.55, 0.3], [0.55, 0.42], [0.12, 0.38], [0.12, 0.7], [0.35, 0.95], [-0.35, 0.95], [-0.12, 0.7], [-0.12, 0.38], [-0.55, 0.42], [-0.55, 0.3], [-0.12, 0.1], [-0.12, -0.75]],
+  bomber: [[0, -1], [0.1, -0.75], [0.1, -0.25], [1, 0.15], [1, 0.27], [0.1, 0.1], [0.1, 0.65], [0.45, 0.82], [0.45, 0.92], [0, 0.85], [-0.45, 0.92], [-0.45, 0.82], [-0.1, 0.65], [-0.1, 0.1], [-1, 0.27], [-1, 0.15], [-0.1, -0.25], [-0.1, -0.75]],
+  f16: [[0, -1], [0.09, -0.7], [0.12, -0.2], [0.85, 0.28], [0.85, 0.4], [0.14, 0.38], [0.14, 0.62], [0.46, 0.86], [0.46, 0.97], [0.08, 0.9], [0.05, 1], [-0.05, 1], [-0.08, 0.9], [-0.46, 0.97], [-0.46, 0.86], [-0.14, 0.62], [-0.14, 0.38], [-0.85, 0.4], [-0.85, 0.28], [-0.12, -0.2], [-0.09, -0.7]],
+};
+
+// Each enemy token pre-rendered once (dark round token, ring and silhouette in the model's colour).
+const tokens = {};
+function token(name) {
+  if (tokens[name]) return tokens[name];
+  const m = MODELS[name], s = 96, c = document.createElement('canvas');
+  c.width = c.height = s;
+  const g = c.getContext('2d');
+  g.translate(s / 2, s / 2);
+  g.beginPath(); g.arc(0, 0, s * 0.42, 0, Math.PI * 2); g.fillStyle = '#0c1117'; g.fill();
+  g.lineWidth = s * 0.05; g.strokeStyle = m.color; g.stroke();
+  if (m.kind === 'ballistic') { g.beginPath(); g.arc(0, 0, s * 0.48, 0, Math.PI * 2); g.lineWidth = s * 0.025; g.stroke(); }
+  poly(g, SHAPES[m.type], s * 0.3); g.fillStyle = m.color; g.fill();
+  return (tokens[name] = c);
+}
+function poly(g, pts, k) {
+  g.beginPath();
+  pts.forEach(([x, y], i) => (i ? g.lineTo(x * k, y * k) : g.moveTo(x * k, y * k)));
+  g.closePath();
+}
+
+// ---------------------------------------------------------------- sound: 8-bit, synthesised
+let actx = null, muted = store.get('sh0fly_mute', '0') === '1';
+const muteBtn = document.getElementById('mute');
+muteBtn.textContent = muted ? '🔇' : '🔊';
+muteBtn.onclick = () => { muted = !muted; store.set('sh0fly_mute', muted ? '1' : '0'); muteBtn.textContent = muted ? '🔇' : '🔊'; };
+function audio() { if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } return actx; }
+function sweep(f0, f1, sec, vol, type = 'square', at = 0) {
+  if (muted || !audio()) return;
+  const t = actx.currentTime + at, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.linearRampToValueAtTime(f1, t + sec);
+  g.gain.setValueAtTime(vol, t); g.gain.linearRampToValueAtTime(0, t + sec);
+  o.connect(g).connect(actx.destination); o.start(t); o.stop(t + sec);
+}
+function noise(sec, vol) {
+  if (muted || !audio()) return;
+  const n = Math.round(sec * actx.sampleRate), b = actx.createBuffer(1, n, actx.sampleRate), d = b.getChannelData(0);
+  let held = 0;
+  for (let i = 0; i < n; i++) { const hold = 2 + Math.round(i / n * 24); if (i % hold === 0) held = Math.random() * 2 - 1; d[i] = held * vol * (1 - i / n); }
+  const s = actx.createBufferSource(); s.buffer = b; s.connect(actx.destination); s.start();
+}
+const sfx = {
+  shot: () => sweep(1400, 500, 0.07, 0.06),
+  boom: () => noise(0.35, 0.35),
+  hit: () => sweep(300, 60, 0.6, 0.15),
+  stage: () => [523, 659, 784, 1047].forEach((f, i) => sweep(f, f, 0.09, 0.06, 'square', i * 0.09)),
+};
+
+// ---------------------------------------------------------------- game state
+const BONUS = {
+  spread: { mark: '3×', title: 'ПОТРІЙНИЙ ВОГОНЬ!', color: '#FFE066' },
+  rapid: { mark: 'R', title: 'ШВИДКОСТРІЛЬНІСТЬ!', color: '#FF7A1A' },
+  homing: { mark: 'AIM', title: 'РАКЕТИ AIM-9!', color: '#22D3EE' },
+  shield: { mark: '◯', title: 'ЩИТ!', color: '#7DD3FC' },
+  life: { mark: '+1', title: '+1 ЖИТТЯ!', color: '#4ADE80' },
+};
+const rnd = Math.random;
+let time = 0, stage = 0, score = 0, hi = +store.get('sh0fly_hi', '0') || 0, best = 0, lives = 3;
+let px = 0, py = 0, tx = 0, ty = 0, alive = true, respawn = 0, invuln = 0, fireCd = 0, diveCd = 3, bannerT = 0, banner = '';
+let gameOver = false, spreadT = 0, rapidT = 0, homingT = 0, homingCd = 0, bonusCd = 20, toastT = 0, toast = '', shield = false;
+let enemies = [], shots = [], sparks = [], powerUps = [], stars = [];
+const minY = () => H * 0.32, maxY = () => H - 60;
+
+function reset() {
+  powerUps = []; spreadT = rapidT = homingT = 0; shield = false; bonusCd = 20; score = 0; lives = 3; stage = 0;
+  gameOver = false; shots = []; sparks = []; alive = true; invuln = 2;
+  px = tx = W / 2; py = ty = H - 120;
+  document.getElementById('over').style.display = 'none';
+  nextStage();
+}
+
+function points(e) {
+  const d = e.state === 'diving';
+  return { shahed: d ? 160 : 100, jet: d ? 250 : 150, missile: d ? 300 : 200, bomber: d ? 800 : 400 }[e.type];
+}
+const radius = (t) => (t === 'bomber' ? 22 : t === 'missile' ? 12 : 16);
+const pick = (a) => a[Math.floor(rnd() * a.length)];
+
+function nextStage() {
+  stage++; enemies = []; banner = 'ХВИЛЯ ' + stage; bannerT = 2.2; diveCd = 3.5; sfx.stage();
+  const rows = [
+    [['strategic', 'mig31', 'tactical'], Math.min(2 + (stage >> 1), 4)],
+    [['kalibr', 'kh101', 'kh59', 'kh22', 'iskanderK', ...(stage >= 2 ? ['kinzhal', 'iskanderM', 'kn23', 's300'] : [])], Math.min(4 + stage, 8)],
+    [['jetShahed', 'lancet'], stage >= 2 ? 8 : 6],
+    [['shahed', 'shahed', 'gerbera', 'recon'], 8],
+    ...(stage >= 3 ? [[['shahed', 'gerbera'], 8]] : []),
+  ];
+  let order = 0;
+  rows.forEach(([pool, count], r) => {
+    for (let c = 0; c < count; c++) {
+      const model = pick(pool), m = MODELS[model];
+      const e = { model, type: m.type, ballistic: m.kind === 'ballistic', col: Math.round((c - (count - 1) / 2) * 2), row: r,
+        hp: model === 'strategic' ? 3 : model === 'mig31' || model === 'tactical' ? 2 : 1, state: 'entering',
+        pos: [-200, -200], prev: [0, 0], t: 0, duration: 1, delay: 0.8 + Math.floor(order / 8) * 1.4 + (order % 8) * 0.11,
+        path: [], fired: false, flash: 0 };
+      order++;
+      enemies.push(e);
+    }
+  });
+  for (const e of enemies) enter(e, (e.row + e.col) % 2 === 0);
+}
+
+function slot(e) {
+  const spread = 1 + (stage >= 2 ? 0.07 * Math.sin(time * 1.3) : 0);
+  const c = W / 2 + Math.sin(time * 0.7) * 14, step = Math.min(21, (W - 70) / 16);
+  return [c + e.col * step * spread, 120 + e.row * 46 * spread];
+}
+function enter(e, fromSide) {
+  const left = e.col < 0;
+  const start = fromSide ? [left ? -40 : W + 40, H * 0.45] : [W / 2 + (left ? -60 : 60), -40];
+  Object.assign(e, { state: 'entering', t: 0, duration: 1.9,
+    path: [start, [W / 2 + (left ? 90 : -90), H * 0.62], [left ? 40 : W - 40, 80], [0, 0]] });
+}
+function dive(e) {
+  const aim = px + (rnd() - 0.5) * 80, side = rnd() < 0.5 ? 1 : -1, p = e.pos;
+  Object.assign(e, { state: 'diving', t: 0, fired: false });
+  if (e.type === 'missile') { e.duration = e.ballistic ? 0.85 : 1.2; e.path = [p, [p[0], p[1] + 60], [aim, H * 0.6], [aim, H + 60]]; }
+  else if (e.type === 'bomber') { e.duration = 3.4; e.path = [p, [p[0] + side * 140, p[1] + 120], [aim - side * 120, H * 0.7], [aim, H + 80]]; }
+  else if (e.type === 'jet') { e.duration = 1.9; e.path = [p, [p[0] + side * 90, p[1] - 40], [aim + side * 140, H * 0.55], [aim, H + 60]]; }
+  else { e.duration = 2.6; e.path = [p, [p[0] + side * 160, p[1] + 80], [aim - side * 160, H * 0.65], [aim, H + 60]]; }
+}
+function bezier(p, t) {
+  const u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return [p[0][0] * a + p[1][0] * b + p[2][0] * c + p[3][0] * d, p[0][1] * a + p[1][1] * b + p[2][1] * c + p[3][1] * d];
+}
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+function initStars() {
+  const colors = ['#FFFFFF', '#22D3EE', '#FFB020', '#FF3B47', '#B794F6'];
+  stars = Array.from({ length: 90 }, () => ({ x: rnd() * W, y: rnd() * H, speed: 20 + rnd() * 90, color: pick(colors) }));
+}
+
+function explode(at, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd() * Math.PI * 2, v = 40 + rnd() * 220;
+    sparks.push({ pos: [...at], vel: [Math.cos(a) * v, Math.sin(a) * v], color: i % 2 ? '#FFFFFF' : color, life: 0.4 + rnd() * 0.5 });
+  }
+}
+
+function spawnPowerUp(at) {
+  const r = rnd();
+  const kind = r < 0.27 ? 'spread' : r < 0.52 ? 'rapid' : r < 0.75 ? 'homing' : r < 0.93 ? 'shield' : 'life';
+  powerUps.push({ kind, pos: [...at], age: 0 });
+}
+function apply(k) {
+  if (k === 'spread') spreadT = 12; else if (k === 'rapid') rapidT = 12;
+  else if (k === 'homing') { homingT = 10; homingCd = 0; } else if (k === 'shield') shield = true; else lives = Math.min(5, lives + 1);
+  toast = BONUS[k].title; toastT = 1.6; score += 250; sfx.stage();
+}
+
+function update(dt) {
+  for (const s of stars) { s.y += s.speed * dt; if (s.y > H) { s.y = 0; s.x = rnd() * W; } }
+  if (bannerT > 0) bannerT -= dt;
+
+  // Player
+  if (alive) {
+    const k = 1 - Math.exp(-14 * dt);
+    tx = Math.max(24, Math.min(W - 24, tx)); ty = Math.max(minY(), Math.min(maxY(), ty));
+    px += (tx - px) * k; py += (ty - py) * k;
+    invuln = Math.max(0, invuln - dt); fireCd -= dt;
+    const mine = shots.filter((s) => !s.enemy && !s.homing).length;
+    if (fireCd <= 0 && mine < (spreadT > 0 ? 9 : rapidT > 0 ? 6 : 3) && !gameOver) {
+      const gun = [px, py - 26];
+      shots.push({ pos: [...gun], vel: [0, -720] });
+      if (spreadT > 0) { shots.push({ pos: [...gun], vel: [-170, -690] }, { pos: [...gun], vel: [170, -690] }); }
+      fireCd = rapidT > 0 ? 0.11 : 0.24; sfx.shot();
+    }
+    homingCd -= dt;
+    if (homingT > 0 && homingCd <= 0 && enemies.length && !gameOver) {
+      for (const side of [-1, 1]) shots.push({ pos: [px + side * 22, py - 6], vel: [side * 60, -260], homing: true });
+      homingCd = 1;
+    }
+    spreadT = Math.max(0, spreadT - dt); rapidT = Math.max(0, rapidT - dt); homingT = Math.max(0, homingT - dt);
+  } else if (!gameOver) {
+    respawn -= dt;
+    if (respawn <= 0) { alive = true; invuln = 2.2; px = tx = W / 2; py = ty = H - 120; }
+  }
+
+  // Enemies
+  const formation = [];
+  for (const e of enemies) {
+    e.flash = Math.max(0, e.flash - dt);
+    if (e.state === 'entering') {
+      if (e.delay > 0) { e.delay -= dt; e.pos = [-200, -200]; continue; }
+      e.t += dt / e.duration;
+      const path = [...e.path]; path[3] = slot(e);
+      e.pos = bezier(path, Math.min(1, e.t));
+      if (e.t >= 1) e.state = 'formation';
+    } else if (e.state === 'formation') {
+      e.pos = slot(e); formation.push(e);
+    } else if (e.state === 'diving') {
+      e.t += dt / e.duration;
+      e.pos = bezier(e.path, Math.min(1, e.t));
+      if (!e.fired && e.t > 0.25 && e.pos[1] < py - 80) {
+        e.fired = true;
+        if (rnd() < 0.55 + stage * 0.05 && alive) {
+          const dx = px - e.pos[0], dy = py - e.pos[1], d = Math.hypot(dx, dy), v = 260 + stage * 12, kab = e.type === 'bomber';
+          shots.push({ pos: [...e.pos], vel: [dx / d * v, dy / d * v], enemy: true, kab });
+          if (kab) {
+            shots.push({ pos: [...e.pos], vel: [dx / d * 260 - 70, dy / d * 260], enemy: true, kab: true },
+              { pos: [...e.pos], vel: [dx / d * 260 + 70, dy / d * 260], enemy: true, kab: true });
+          }
+        }
+      }
+      if (e.t >= 1) { e.state = 'returning'; e.t = 0; e.pos = [slot(e)[0], -40]; }
+    } else {
+      e.t += dt;
+      const s = slot(e), t = Math.min(1, e.t);
+      e.pos = [s[0], -40 + (s[1] + 40) * t];
+      if (e.t >= 1) e.state = 'formation';
+    }
+  }
+
+  // Who dives next: faster and more of them every stage.
+  diveCd -= dt;
+  if (diveCd <= 0 && formation.length && alive && !gameOver) {
+    for (let i = 0, n = Math.min(1 + (stage >> 1), 3); i < n && formation.length; i++) dive(formation.splice(Math.floor(rnd() * formation.length), 1)[0]);
+    diveCd = Math.max(0.9, 2.8 - stage * 0.25) * (0.6 + rnd() * 0.8);
+  }
+
+  // Shots (AIM-9 turn towards the nearest enemy and speed up)
+  for (const s of shots) {
+    if (s.homing && enemies.length) {
+      const tgt = enemies.reduce((a, b) => (dist(a.pos, s.pos) < dist(b.pos, s.pos) ? a : b));
+      const want = [tgt.pos[0] - s.pos[0], tgt.pos[1] - s.pos[1]], wl = Math.hypot(...want) || 1;
+      const sp = Math.min(Math.hypot(...s.vel) + 600 * dt, 620), vl = Math.hypot(...s.vel) || 1, k = Math.min(1, 6 * dt);
+      const dir = [s.vel[0] / vl * (1 - k) + want[0] / wl * k, s.vel[1] / vl * (1 - k) + want[1] / wl * k], dl = Math.hypot(...dir) || 1;
+      s.vel = [dir[0] / dl * sp, dir[1] / dl * sp];
+      if (Math.floor(time * 30) % 2 === 0) sparks.push({ pos: [...s.pos], vel: [0, 0], color: '#7DD3FC', life: 0.25 });
+    }
+    s.pos[0] += s.vel[0] * dt; s.pos[1] += s.vel[1] * dt;
+  }
+
+  updatePowerUps(dt);
+  shots = shots.filter((s) => s.pos[1] > -20 && s.pos[1] < H + 20 && s.pos[0] > -20 && s.pos[0] < W + 20);
+
+  // Hits on enemies
+  for (const s of shots.filter((s) => !s.enemy)) {
+    for (const e of enemies) {
+      if (e.state === 'entering' && e.delay > 0) continue;
+      if (dist(e.pos, s.pos) < radius(e.type)) {
+        shots.splice(shots.indexOf(s), 1);
+        e.hp--; e.flash = 0.15;
+        if (e.hp <= 0) { score += points(e); explode(e.pos, MODELS[e.model].color, 26); sfx.boom(); if (rnd() < 0.08) spawnPowerUp(e.pos); }
+        break;
+      }
+    }
+  }
+  enemies = enemies.filter((e) => e.hp > 0);
+
+  // Hits on the player
+  if (alive && invuln <= 0 && !gameOver) {
+    const me = [px, py];
+    const bullet = shots.find((s) => s.enemy && dist(s.pos, me) < 16);
+    const rammer = enemies.find((e) => e.state === 'diving' && dist(e.pos, me) < radius(e.type) + 12);
+    if ((bullet || rammer) && shield) {
+      shield = false; invuln = 1.2;
+      if (bullet) shots.splice(shots.indexOf(bullet), 1);
+      if (rammer) { enemies.splice(enemies.indexOf(rammer), 1); explode(rammer.pos, MODELS[rammer.model].color, 20); }
+      explode(me, '#7DD3FC', 18); sfx.boom();
+    } else if (bullet || rammer) {
+      if (rammer) { enemies.splice(enemies.indexOf(rammer), 1); explode(rammer.pos, MODELS[rammer.model].color, 20); }
+      spreadT = rapidT = homingT = 0;
+      shots = shots.filter((s) => !s.enemy);
+      explode(me, '#B8C7D9', 46); sfx.hit();
+      alive = false; lives--;
+      if (lives <= 0) over(); else respawn = 1.8;
+    }
+  }
+
+  for (const p of sparks) { p.pos[0] += p.vel[0] * dt; p.pos[1] += p.vel[1] * dt; p.life -= dt; }
+  sparks = sparks.filter((p) => p.life > 0);
+  if (!enemies.length && !gameOver && bannerT <= 0) nextStage();
+  if (score > hi) hi = score;
+}
+
+function updatePowerUps(dt) {
+  bonusCd -= dt;
+  if (bonusCd <= 0 && !gameOver) { spawnPowerUp([40 + rnd() * (W - 80), -20]); bonusCd = 20 + rnd() * 12; }
+  if (toastT > 0) toastT -= dt;
+  const me = [px, py];
+  for (const p of [...powerUps]) {
+    p.age += dt;
+    const to = [me[0] - p.pos[0], me[1] - p.pos[1]], d = Math.max(1, Math.hypot(...to));
+    p.pos[0] += (to[0] / d * 90 + Math.sin(p.age * 3) * 40) * dt;
+    p.pos[1] += Math.max(70, to[1] / d * 120) * dt;
+    const hit = shots.find((s) => !s.enemy && dist(s.pos, p.pos) < 16);
+    if (hit) {
+      shots.splice(shots.indexOf(hit), 1); powerUps.splice(powerUps.indexOf(p), 1);
+      explode(p.pos, '#8B95A3', 12); toast = 'БОНУС ЗНИЩЕНО'; toastT = 1.2; continue;
+    }
+    if (alive && dist(p.pos, me) < 28) { powerUps.splice(powerUps.indexOf(p), 1); apply(p.kind); continue; }
+    if (p.pos[1] > H + 30 || p.age > 14) powerUps.splice(powerUps.indexOf(p), 1);
+  }
+}
+
+function over() {
+  gameOver = true;
+  best = Math.max(best, score);
+  if (score >= hi) { hi = score; store.set('sh0fly_hi', String(hi)); }
+  document.getElementById('result').textContent = `РАХУНОК ${score}   ХВИЛЯ ${stage}   РЕКОРД ${hi}`;
+  document.getElementById('save').style.display = tg ? '' : 'none';
+  document.getElementById('over').style.display = 'flex';
+}
+
+// The best of this session to the bot: it keeps the table (the app closes after it).
+function sendToBot() {
+  if (tg) { try { tg.sendData(JSON.stringify({ game: 'sky', score: best, stage })); } catch (e) {} tg.close(); }
+}
+document.getElementById('again').onclick = reset;
+document.getElementById('save').onclick = sendToBot;
+document.getElementById('quit').onclick = () => {
+  if (tg && best > 0) return sendToBot();
+  if (tg) tg.close(); else history.back();
+};
+
+// ---------------------------------------------------------------- drawing
+function text(s, color, size, x, y, align = 'left') {
+  cx.font = `900 ${size}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
+  cx.fillStyle = color; cx.textAlign = align; cx.textBaseline = 'top';
+  cx.fillText(s, x, y);
+}
+function drawF16(x, y, k, alpha = 1) {
+  cx.save(); cx.globalAlpha = alpha; cx.translate(x, y);
+  poly(cx, SHAPES.f16, k);
+  cx.shadowColor = 'rgba(34,211,238,.6)'; cx.shadowBlur = 8; cx.fillStyle = '#C9D6E4'; cx.fill(); cx.shadowBlur = 0;
+  cx.lineWidth = 1; cx.strokeStyle = '#05070A'; cx.stroke();
+  cx.fillStyle = '#22D3EE'; cx.beginPath(); cx.ellipse(0, -0.47 * k, 0.06 * k, 0.15 * k, 0, 0, Math.PI * 2); cx.fill();
+  cx.fillStyle = '#FF5A3C'; cx.beginPath(); cx.arc(0, 1.02 * k, 0.07 * k + Math.random() * 1.5, 0, Math.PI * 2); cx.fill();
+  cx.restore();
+}
+function draw() {
+  cx.fillStyle = '#000'; cx.fillRect(0, 0, W, H);
+  for (const s of stars) {
+    cx.globalAlpha = (120 + 135 * (0.5 + 0.5 * Math.sin(time * 3 + s.x))) / 255;
+    cx.fillStyle = s.color; cx.fillRect(s.x, s.y, 2, 2);
+  }
+  cx.globalAlpha = 1;
+
+  for (const e of enemies) {
+    if (e.state === 'entering' && e.delay > 0) continue;
+    const vx = e.pos[0] - e.prev[0], vy = e.pos[1] - e.prev[1];
+    e.prev = [...e.pos];
+    const angle = e.state === 'formation' || Math.hypot(vx, vy) < 0.3 ? Math.PI : Math.atan2(vx, -vy);
+    const size = e.type === 'bomber' ? 46 : e.type === 'missile' ? 32 : 36;
+    cx.save(); cx.translate(e.pos[0], e.pos[1]); cx.rotate(angle); cx.globalAlpha = e.flash > 0 ? 0.45 : 1;
+    cx.drawImage(token(e.model), -size / 2, -size / 2, size, size); cx.restore();
+  }
+
+  for (const s of shots) {
+    cx.save(); cx.translate(s.pos[0], s.pos[1]); cx.rotate(Math.atan2(s.vel[0], -s.vel[1]));
+    if (s.kab) { cx.fillStyle = '#FF8A1F'; poly(cx, SHAPES.missile, 7); cx.fill(); }
+    else if (s.homing) {
+      cx.fillStyle = '#E6EDF3'; cx.fillRect(-1.5, -7, 3, 14); cx.fillStyle = '#22D3EE'; cx.fillRect(-4, 3, 8, 2);
+      cx.fillStyle = '#FF7A1A'; cx.beginPath(); cx.arc(0, 8, 2.2, 0, Math.PI * 2); cx.fill();
+    } else if (s.enemy) { cx.fillStyle = '#FF3B47'; cx.fillRect(-1.5, -4.5, 3, 9); }
+    else { cx.fillStyle = '#FFE066'; cx.fillRect(-1.5, -6, 3, 9); cx.fillStyle = '#fff'; cx.fillRect(-1.5, 3, 3, 3); }
+    cx.restore();
+  }
+
+  for (const p of powerUps) {
+    const pulse = 0.5 + 0.5 * Math.sin(p.age * 8), b = BONUS[p.kind];
+    cx.shadowColor = b.color; cx.shadowBlur = 10 + 4 * pulse;
+    cx.beginPath(); cx.arc(p.pos[0], p.pos[1], 13, 0, Math.PI * 2); cx.fillStyle = '#0C1117'; cx.fill();
+    cx.shadowBlur = 0; cx.lineWidth = 2; cx.strokeStyle = b.color; cx.stroke();
+    cx.font = `900 ${b.mark.length > 2 ? 8 : 11}px ui-monospace, Menlo, monospace`; cx.fillStyle = b.color;
+    cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.fillText(b.mark, p.pos[0], p.pos[1] + 1);
+  }
+
+  if (shield && alive && !gameOver) {
+    cx.globalAlpha = Math.max(0, Math.min(1, (150 + 100 * Math.sin(time * 6)) / 255));
+    cx.beginPath(); cx.arc(px, py, 32, 0, Math.PI * 2); cx.lineWidth = 2; cx.strokeStyle = '#7DD3FC'; cx.stroke(); cx.globalAlpha = 1;
+  }
+  if (alive && !gameOver && !(invuln > 0 && Math.floor(time * 10) % 2 === 0)) drawF16(px, py, 26);
+
+  for (const p of sparks) {
+    cx.globalAlpha = Math.max(0, Math.min(1, p.life / 0.9)); cx.fillStyle = p.color; cx.fillRect(p.pos[0] - 1.5, p.pos[1] - 1.5, 3, 3);
+  }
+  cx.globalAlpha = 1;
+
+  // Active bonus weapons, bottom right, with time bars
+  let bx = W - 16;
+  for (const [k, t, total] of [['homing', homingT, 10], ['rapid', rapidT, 12], ['spread', spreadT, 12]]) {
+    if (t <= 0) continue;
+    bx -= 40;
+    text(BONUS[k].mark, BONUS[k].color, 11, bx + 20, H - 52, 'center');
+    cx.fillStyle = '#1C2530'; cx.fillRect(bx + 2, H - 34, 36, 3);
+    cx.fillStyle = BONUS[k].color; cx.fillRect(bx + 2, H - 34, 36 * Math.min(1, t / total), 3);
+  }
+  if (toastT > 0) text(toast, toast === 'БОНУС ЗНИЩЕНО' ? '#8B95A3' : '#FFE066', 16, W / 2, H * 0.62, 'center');
+
+  // HUD: 1UP / score / record / stage / lives
+  const top = 52;
+  if (Math.floor(time * 2) % 2 === 0) text('1UP', '#FF3B47', 13, 16, top);
+  text(String(score).padStart(6, '0'), '#fff', 15, 16, top + 16);
+  text('РЕКОРД', '#FF3B47', 13, W / 2, top, 'center');
+  text(String(hi).padStart(6, '0'), '#fff', 15, W / 2, top + 16, 'center');
+  text('ХВИЛЯ ' + stage, '#22D3EE', 12, W - 16, top + 8, 'right');
+  for (let i = 0; i < lives - (alive ? 1 : 0); i++) drawF16(24 + i * 30, H - 40, 12);
+
+  if (bannerT > 0 && !gameOver) {
+    text(banner, '#22D3EE', 26, W / 2, H * 0.45, 'center');
+    if (Math.floor(time * 3) % 2 === 0) text('ГОТОВІ!', '#FF3B47', 18, W / 2, H * 0.45 + 40, 'center');
+  }
+}
+
+// ---------------------------------------------------------------- input and loop
+// Relative steering: the plane follows the finger's movement, so the finger never covers it.
+let last = null;
+cv.addEventListener('pointerdown', (e) => { last = [e.clientX, e.clientY]; audio(); if (actx && actx.state === 'suspended') actx.resume(); });
+cv.addEventListener('pointermove', (e) => {
+  if (!last) return;
+  tx += (e.clientX - last[0]) * 1.4; ty += (e.clientY - last[1]) * 1.4; last = [e.clientX, e.clientY];
+});
+for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) cv.addEventListener(ev, () => (last = null));
+window.addEventListener('keydown', (e) => {
+  const k = { ArrowLeft: [-30, 0], ArrowRight: [30, 0], ArrowUp: [0, -30], ArrowDown: [0, 30] }[e.key];
+  if (k) { tx += k[0]; ty += k[1]; }
+});
+
+let prevT = null;
+function frame(t) {
+  const dt = prevT == null ? 0 : Math.min(0.05, (t - prevT) / 1000);
+  prevT = t;
+  if (!stars.length) initStars();
+  if (stage === 0) {
+    reset();
+    // ?ff=8: play 8 seconds at once (for screenshots and checks).
+    const ff = +new URLSearchParams(location.search).get('ff') || 0;
+    for (let i = 0; i < ff * 60; i++) { time += 1 / 60; update(1 / 60); }
+  }
+  time += dt;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
